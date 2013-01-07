@@ -18,12 +18,16 @@
 #
 
 require 'chef/knife/ec2_base'
+require 'chef/knife/winrm_base'
+require 'winrm'
+require 'httpclient'
 
 class Chef
   class Knife
     class Ec2ServerCreate < Knife
 
       include Knife::Ec2Base
+      include Knife::WinrmBase
 
       deps do
         require 'fog'
@@ -32,6 +36,8 @@ class Chef
         require 'chef/knife/bootstrap'
         require 'chef/knife/bootstrap_windows_ssh'
         require 'chef/knife/core/windows_bootstrap_context'
+        require 'chef/knife/winrm'
+
         Chef::Knife::Bootstrap.load_deps
       end
 
@@ -210,6 +216,43 @@ class Chef
         :description => "The EC2 server attribute to use for SSH connection",
         :default => nil
 
+      def tcp_test_winrm(hostname)
+        endpoint = "http://#{hostname}:#{config[:winrm_port]}/wsman"
+        winrm = WinRM::WinRMWebService.new(endpoint, :plaintext, 
+                                             :user => locate_config_value(:ssh_user), 
+                                             :pass => locate_config_value(:ssh_password))
+       if winrm.open_shell() 
+         Chef::Log.debug("WinRM accepting connections on #{hostname}")
+          return true
+        else
+          return false
+        end
+      rescue GSSAPI::GssApiError
+        sleep 10
+        false
+      rescue HTTPClient::ConnectTimeoutError
+        sleep 2
+        false
+      rescue SocketError
+        sleep 2
+        false
+      rescue Errno::ETIMEDOUT
+        false
+      rescue Errno::EPERM
+        false
+      rescue Errno::ECONNREFUSED
+        sleep 2
+        false
+      # This happens on EC2 quite often
+      rescue Errno::EHOSTUNREACH
+        sleep 2
+        false
+      # This happens on EC2 sometimes
+      rescue Errno::ENETUNREACH
+        sleep 2
+        false
+      end
+
       def tcp_test_ssh(hostname, ssh_port)
         tcp_socket = TCPSocket.new(hostname, ssh_port)
         readable = IO.select([tcp_socket], nil, nil, 5)
@@ -310,6 +353,7 @@ class Chef
         if image_info.platform == 'windows'
           print "\n#{ui.color("Waiting for rdp", :magenta)}"
           wait_for_rdp(ssh_connect_host)
+          sleep 30
           bootstrap_for_windows_node(@server,ssh_connect_host).run
         else
           print "\n#{ui.color("Waiting for sshd", :magenta)}"
@@ -372,7 +416,7 @@ class Chef
         bootstrap.config[:chef_node_name] = config[:chef_node_name] || server.id
         bootstrap.config[:encrypted_data_bag_secret] = config[:encrypted_data_bag_secret]
         bootstrap.config[:encrypted_data_bag_secret_file] = config[:encrypted_data_bag_secret_file]
-
+        bootstrap.config[:first_boot_attributes] = locate_config_value(:json_attributes) || {}
         bootstrap.config[:prerelease] = config[:prerelease]
         bootstrap.config[:bootstrap_version] = locate_config_value(:bootstrap_version)
         bootstrap.config[:distro] = locate_config_value(:distro)
@@ -539,7 +583,8 @@ class Chef
       end
 
       def wait_for_direct_rdp(hostname, rdp_port)
-        print(".") until tcp_test_rdp(ssh_connect_host, rdp_port) {
+        #print(".") until tcp_test_rdp(ssh_connect_host, rdp_port) {
+        print(".") until tcp_test_winrm(hostname) {
           sleep @initial_sleep_delay ||= (vpc_mode? ? 40 : 10)
           puts("done")
         }
